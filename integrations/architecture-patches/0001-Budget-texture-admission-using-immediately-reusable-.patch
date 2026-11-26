@@ -1,0 +1,115 @@
+From d481667d053ba4d6ba90de152f0fe7379b1eee27 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 09:43:35 -0600
+Subject: [PATCH 1/3] Budget texture admission using immediately reusable heap
+ ranges
+
+---
+ crates/victory-gpu/src/pool.rs | 33 ++++++++++++++++++++++++---------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/crates/victory-gpu/src/pool.rs b/crates/victory-gpu/src/pool.rs
+index cde4cdb..f00083c 100644
+--- a/crates/victory-gpu/src/pool.rs
++++ b/crates/victory-gpu/src/pool.rs
+@@ -199,11 +199,13 @@ struct Pool<B> {
+     spare: usize,
+     most: usize,
+     retry_growth_at: u64,
++    /// Sum of the ranges currently available in the block free lists.
++    free_bytes: u64,
+ }
+ 
+ impl<B: Clone> Pool<B> {
+     const fn new(most: usize) -> Pool<B> {
+-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
++        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, free_bytes: 0 }
+     }
+ 
+     /// A piece of `len` bytes and the memory it lies in, and whether that
+@@ -270,6 +272,7 @@ impl<B: Clone> Pool<B> {
+             }
+         }
+         let block = self.blocks[i].as_mut()?;
++        self.free_bytes -= len;
+         let again = start < block.used_to;
+         block.used_to = block.used_to.max(start + len);
+         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+@@ -294,6 +297,7 @@ impl<B: Clone> Pool<B> {
+                 self.blocks.len() - 1
+             }
+         };
++        self.free_bytes += BLOCK;
+         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+         i
+     }
+@@ -316,6 +320,7 @@ impl<B: Clone> Pool<B> {
+             self.resting.pop_front();
+             if let Some(block) = self.blocks[piece.block].as_mut() {
+                 block.free.give(piece.start, piece.len);
++                self.free_bytes += piece.len;
+                 any |= block.free.whole(BLOCK);
+             }
+         }
+@@ -328,6 +333,7 @@ impl<B: Clone> Pool<B> {
+                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                     spare += 1;
+                     if spare > most {
++                        self.free_bytes -= BLOCK;
+                         *block = None;
+                     }
+                 }
+@@ -353,13 +359,10 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+     m.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
+-/// Bytes of the pieces textures hold now.
+-static HELD: AtomicU64 = AtomicU64::new(0);
+-
+-/// Bytes of the texture blocks no texture holds: the card's memory in use
+-/// by us that new textures take first.
++/// Aggregate free-list capacity. Alignment and fragmentation can still
++/// prevent a particular allocation from fitting.
+ pub(crate) fn texture_room() -> u64 {
+-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
++    lock(&TEXTURES).free_bytes
+ }
+ 
+ /// For the memory line: blocks of textures and of staging buffers, in MiB.
+@@ -452,7 +455,6 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
+         if left == 0 {
+             let gone = Box::from_raw(this.cast::<Reclaim>());
+-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+             lock(&TEXTURES).give(gone.piece, now());
+         }
+         left
+@@ -549,7 +551,6 @@ pub(crate) unsafe fn texture(
+     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
+     match (result, made) {
+         (Ok(()), Some(made)) => {
+-            HELD.fetch_add(piece.len, Ordering::Relaxed);
+             give_back_with(&made, piece);
+             made_now(&made);
+             #[cfg(feature = "diagnostics")]
+@@ -639,6 +640,20 @@ mod tests {
+         assert_eq!(pool.blocks(), 0);
+     }
+ 
++    #[test]
++    fn budget_excludes_retired_pieces_until_reusable() {
++        let mut pool = Pool::new(2);
++        let (piece, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(())).unwrap();
++        assert_eq!(pool.free_bytes, BLOCK / 2);
++        pool.give(piece, 1);
++        pool.reclaim(REST, 0, true);
++        assert_eq!(pool.free_bytes, BLOCK / 2);
++        pool.reclaim(REST + 1, 1, true);
++        assert_eq!(pool.free_bytes, BLOCK);
++        pool.reclaim(REST + 2, 0, true);
++        assert_eq!(pool.free_bytes, 0);
++    }
++
+     #[test]
+     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
+         let mut pool: Pool<u32> = Pool::new(SPARE);

@@ -1,0 +1,87 @@
+From 6956aa5893e044628f8f0d147f7085ec4b37404c Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 10:08:07 -0600
+Subject: [PATCH] Measure cache-miss work and texture heap fragmentation during
+ captures
+
+---
+ crates/victory-gpu/src/host.rs       |  3 +++
+ crates/victory-gpu/src/pool.rs       | 22 ++++++++++++++++++++++
+ crates/victory-pipeline/src/cache.rs | 14 +++++++++++---
+ 3 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 3d2fed8..bab08ba 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -8740,6 +8740,9 @@ impl Meter {
+         let dropped = crate::draw::take_dropped() as f64 / frames;
+         let indirect = crate::list::take_indirect() as f64 / frames;
+         if self.measure_checkpoint {
++            crate::pool::log_texture_pool();
++            let (hits, misses) = crate::shader_cache::counts();
++            tracing::info!(target: "checkpoint_bench", hits, misses, "shader totals");
+             if let Some((commit_bytes, working_set_bytes)) = process_memory() {
+                 tracing::info!(target: "checkpoint_bench", commit_bytes, working_set_bytes, "process memory");
+             }
+diff --git a/crates/victory-gpu/src/pool.rs b/crates/victory-gpu/src/pool.rs
+index 1f00004..1922082 100644
+--- a/crates/victory-gpu/src/pool.rs
++++ b/crates/victory-gpu/src/pool.rs
+@@ -365,6 +365,28 @@ pub(crate) fn texture_room() -> u64 {
+     lock(&TEXTURES).free_bytes
+ }
+ 
++/// Fragmentation census for opt-in capture only. Skip a busy pool instead
++/// of making the presenting thread wait for a driver allocation.
++pub(crate) fn log_texture_pool() {
++    let Ok(pool) = TEXTURES.try_lock() else { return };
++    let mut blocks = 0u64;
++    let mut empty = 0u64;
++    let mut ranges = 0usize;
++    let mut largest = 0u64;
++    for block in pool.blocks.iter().flatten() {
++        blocks += 1;
++        empty += u64::from(block.free.whole(BLOCK));
++        ranges += block.free.0.len();
++        largest = largest.max(block.free.0.values().copied().max().unwrap_or(0));
++    }
++    let retired_bytes: u64 = pool.resting.iter().map(|(_, piece)| piece.len).sum();
++    let free_bytes = pool.free_bytes;
++    drop(pool);
++    tracing::info!(target: "checkpoint_bench", heap_bytes = blocks * BLOCK,
++        empty_bytes = empty * BLOCK, free_bytes, retired_bytes, largest_range = largest,
++        ranges, "texture pool");
++}
++
+ /// For the memory line: blocks of textures and of staging buffers, in MiB.
+ #[cfg(feature = "diagnostics")]
+ pub(crate) fn memory() -> [u64; 2] {
+diff --git a/crates/victory-pipeline/src/cache.rs b/crates/victory-pipeline/src/cache.rs
+index 9692d29..830005b 100644
+--- a/crates/victory-pipeline/src/cache.rs
++++ b/crates/victory-pipeline/src/cache.rs
+@@ -54,9 +54,17 @@ impl Cache {
+             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+             return Ok(path);
+         }
+-        let output = converter
+-            .convert(input)
+-            .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
++        // Time only converter misses, including failed attempts. The shader converter
++        // includes DXIL generation and serialization. Disk publication follows below.
++        static MEASURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let start = MEASURE.get_or_init(|| std::env::var("VICTORY_BENCH_PRESENTS").as_deref() == Ok("1"))
++            .then(std::time::Instant::now);
++        let result = converter.convert(input);
++        if let Some(start) = start {
++            tracing::info!(target: "checkpoint_bench", converter = converter.id(),
++                elapsed_us = start.elapsed().as_micros() as u64, success = result.is_ok(), "cache conversion");
++        }
++        let output = result.with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
+         let dir = path.parent().expect("hashed path has a parent");
+         std::fs::create_dir_all(dir)?;
+         // Write-then-rename so readers never see partial output.
+-- 
+2.47.1.windows.1
+

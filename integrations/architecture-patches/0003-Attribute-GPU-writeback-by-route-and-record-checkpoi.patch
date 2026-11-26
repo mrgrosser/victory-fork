@@ -1,0 +1,240 @@
+From 0b163e2b4e8a8a248722e90baa99eb2b8cd06198 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 09:48:36 -0600
+Subject: [PATCH 3/3] Attribute GPU writeback by route and record checkpoint
+ memory budgets
+
+---
+ crates/victory-gpu/src/host.rs       | 60 ++++++++++++++++++----------
+ crates/victory-gpu/src/host/panel.rs |  6 +--
+ scripts/checkpoint_stats.py          | 40 +++++++++++++++++++
+ 3 files changed, 82 insertions(+), 24 deletions(-)
+ create mode 100644 scripts/checkpoint_stats.py
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 9a0cf65..3d2fed8 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -631,8 +631,13 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
+ /// After submissions: shader-written ranges compared and copied back into
+ /// title memory (microseconds, bytes that differed), since the last
+ /// frame-rate line.
+-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
+-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
++use std::sync::atomic::AtomicU64 as ReadbackCounter;
++static COPY_BACK_US: ReadbackCounter = ReadbackCounter::new(0);
++static SHADOW_BACK_BYTES: ReadbackCounter = ReadbackCounter::new(0);
++static RELAY_SHADOW_BACK_BYTES: ReadbackCounter = ReadbackCounter::new(0);
++static CARD_BACK_BYTES: ReadbackCounter = ReadbackCounter::new(0);
++static RELAY_CARD_BACK_BYTES: ReadbackCounter = ReadbackCounter::new(0);
++
+ 
+ /// The card's clock, for the frame line of every run, in microseconds since
+ /// the last one: how long the card had nothing of ours queued; how much of
+@@ -768,18 +773,22 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
+ /// makes at its start).
+ pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
+-/// The process's private bytes (diagnostics: around the making of lists).
+-#[cfg(feature = "diagnostics")]
+-fn private_bytes() -> u64 {
++/// Process commit and resident working set, sampled independently of DXGI.
++fn process_memory() -> Option<(u64, u64)> {
+     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+     let mut c = PROCESS_MEMORY_COUNTERS {
+         cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+         ..Default::default()
+     };
+-    // SAFETY: our own process and a sized structure.
+-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+-    c.PagefileUsage as u64
++    // SAFETY: current process and correctly sized output.
++    (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0)
++        .then_some((c.PagefileUsage as u64, c.WorkingSetSize as u64))
++}
++
++#[cfg(feature = "diagnostics")]
++fn private_bytes() -> u64 {
++    process_memory().map_or(0, |(commit, _)| commit)
+ }
+ 
+ /// What the runtime does when the host GPU fails for good: report it like a
+@@ -824,7 +833,6 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+ static HOST: OnceLock<Option<Host>> = OnceLock::new();
+ 
+ /// The host GPU if it is made already.
+-#[cfg(feature = "diagnostics")]
+ pub(crate) fn made_host() -> Option<&'static Host> {
+     HOST.get()?.as_ref()
+ }
+@@ -3560,7 +3568,7 @@ impl RelayBack {
+         }
+         land::spent(land::stat::BACK, merging);
+         for ((_, from, to), written) in self.work.iter().zip(written) {
+-            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
++            RELAY_SHADOW_BACK_BYTES.fetch_add(written, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::compared(*from, to - from, written as usize);
+             let _ = (from, to);
+@@ -3909,7 +3917,7 @@ fn hand_back(back: &[Declared]) {
+         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+         for ((shadow, from, to), found) in work.iter().zip(found) {
+             let written = shadow.copy_back_with(*from, to - from, Some(found));
+-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++            SHADOW_BACK_BYTES.fetch_add(written as u64, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::compared(*from, to - from, written);
+         }
+@@ -3941,7 +3949,7 @@ fn hand_back(back: &[Declared]) {
+         }
+         for (from, to) in spans {
+             let written = shadow.copy_back(from, to - from);
+-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++            SHADOW_BACK_BYTES.fetch_add(written as u64, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::compared(from, to - from, written);
+         }
+@@ -4824,7 +4832,7 @@ impl Host {
+             }
+         }
+         land::spent(land::stat::CARD, merging);
+-        COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
++        RELAY_CARD_BACK_BYTES.fetch_add(written, Ordering::Relaxed);
+         if let Some(f) = fetch.as_mut() {
+             if let Some(check) = &check {
+                 check.done(&mut f.suspects);
+@@ -4900,7 +4908,7 @@ impl Host {
+                     }
+                 }
+                 crate::land::spent(crate::land::stat::DONE, finishing);
+-                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
++                COPY_BACK_US.fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
+             }
+@@ -5112,7 +5120,7 @@ impl Host {
+             }
+         }
+         for (r, written) in plan.ranges.iter().zip(written) {
+-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
++            CARD_BACK_BYTES.fetch_add(written as u64, Ordering::Relaxed);
+             let (from, to) = r.declared;
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::compared(from, to - from, written);
+@@ -5386,7 +5394,7 @@ impl Host {
+                     }
+                 }
+                 hand_back(&back);
+-                COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
++                COPY_BACK_US.fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+             }
+             // In the order given: what tells the title the card is done.
+             let mut last = 0;
+@@ -5877,7 +5885,7 @@ impl Host {
+             add(C::NothingBack, 1);
+             add(C::NothingBackUs, gpu.as_micros() as u64);
+         }
+-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
++        COPY_BACK_US.fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+         for list in runs {
+             // Read backs first: a value written at the bottom of the pipe
+             // may be what tells the title that they are there.
+@@ -8724,13 +8732,23 @@ impl Meter {
+             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+         });
+-        let [back_ms, back_mb] = [0, 1].map(|i| {
+-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+-        });
++        let back_ms = COPY_BACK_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
++        let [shadow_mb, relay_shadow_mb, card_mb, relay_card_mb] =
++            [&SHADOW_BACK_BYTES, &RELAY_SHADOW_BACK_BYTES, &CARD_BACK_BYTES, &RELAY_CARD_BACK_BYTES]
++                .map(|counter| counter.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
++        let back_mb = shadow_mb + relay_shadow_mb + card_mb + relay_card_mb;
+         let dropped = crate::draw::take_dropped() as f64 / frames;
+         let indirect = crate::list::take_indirect() as f64 / frames;
+         if self.measure_checkpoint {
+-            tracing::info!(target: "checkpoint_bench", frames, ms, draws, dropped, indirect, copy_ms, back_ms, back_mb, "interval");
++            if let Some((commit_bytes, working_set_bytes)) = process_memory() {
++                tracing::info!(target: "checkpoint_bench", commit_bytes, working_set_bytes, "process memory");
++            }
++            if let Some([local_budget, local_used, shared_budget, shared_used]) = made_host().and_then(Host::video_memory) {
++                tracing::info!(target: "checkpoint_bench", local_budget, local_used, shared_budget, shared_used,
++                    staging_bytes = crate::texture::live_staging_bytes(), shadow_span = crate::shadow::live_span_bytes(),
++                    pool_free = crate::pool::texture_room(), "memory");
++            }
++            tracing::info!(target: "checkpoint_bench", frames, ms, draws, dropped, indirect, copy_ms, back_ms, back_mb, shadow_mb, relay_shadow_mb, card_mb, relay_card_mb, texture_ms, texture_mb, prepare_ms = cpu, gpu_wait_ms = gpu, "interval");
+         }
+         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+diff --git a/crates/victory-gpu/src/host/panel.rs b/crates/victory-gpu/src/host/panel.rs
+index a3d2f9b..9b45c96 100644
+--- a/crates/victory-gpu/src/host/panel.rs
++++ b/crates/victory-gpu/src/host/panel.rs
+@@ -176,7 +176,7 @@ const COUNTERS: usize = 11;
+ 
+ impl Counters {
+     fn now() -> Counters {
+-        use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
++        use super::{CARD_CLOCK_US, COPY_BACK_US, SHADOW_BACK_BYTES, RELAY_SHADOW_BACK_BYTES, CARD_BACK_BYTES, RELAY_CARD_BACK_BYTES, PREPARING};
+         use crate::copystat::{C, peek};
+         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+         Counters([
+@@ -185,8 +185,8 @@ impl Counters {
+             get(&CARD_CLOCK_US[1]),
+             get(&CARD_CLOCK_US[2]),
+             get(&PREPARING[3]),
+-            get(&COPY_BACK[0]),
+-            get(&COPY_BACK[1]),
++            get(&COPY_BACK_US),
++            get(&SHADOW_BACK_BYTES) + get(&RELAY_SHADOW_BACK_BYTES) + get(&CARD_BACK_BYTES) + get(&RELAY_CARD_BACK_BYTES),
+             get(&crate::shadow::CARD_STATS[0]),
+             crate::draw::dropped_now(),
+             peek(C::RecordNs),
+diff --git a/scripts/checkpoint_stats.py b/scripts/checkpoint_stats.py
+new file mode 100644
+index 0000000..b748b18
+--- /dev/null
++++ b/scripts/checkpoint_stats.py
+@@ -0,0 +1,40 @@
++"""Summarize checkpoint_bench presents inside a visually verified time window."""
++import argparse
++import json
++import math
++from datetime import datetime
++from statistics import mean, median
++
++
++def summarize(lines, start, seconds):
++    if not math.isfinite(seconds) or seconds <= 0:
++        raise ValueError("duration must be finite and positive")
++    end = start + seconds
++    stamps = []
++    for line in lines:
++        if "checkpoint_bench: present " in line:
++            stamps.append(datetime.fromisoformat(line.split()[0]).timestamp())
++    if not stamps or stamps[0] > start or stamps[-1] < end:
++        raise ValueError("trace does not cover the full window")
++    if any(b < a for a, b in zip(stamps, stamps[1:])):
++        raise ValueError("present timestamps moved backwards")
++    times = sorted(1000 * (b - a) for a, b in zip(stamps, stamps[1:])
++                   if start <= a and b <= end)
++    if not times or sum(times) == 0:
++        raise ValueError("window contains insufficient complete frame intervals")
++    n = len(times)
++    worst = times[-math.ceil(n / 100):]
++    return dict(presents=sum(start <= t < end for t in stamps),
++                fps=sum(start <= t < end for t in stamps) / seconds,
++                low_1pct_fps=1000 / mean(worst), median_ms=median(times),
++                p95_ms=times[math.ceil(n*.95)-1], p99_ms=times[math.ceil(n*.99)-1],
++                max_ms=times[-1], complete_intervals=n)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("trace", type=argparse.FileType("r", encoding="utf-8"))
++    parser.add_argument("start_epoch_ms", type=int, help="UTC timestamp of the verified scene start")
++    parser.add_argument("--seconds", type=float, default=60)
++    args = parser.parse_args()
++    print(json.dumps(summarize(args.trace, args.start_epoch_ms / 1000, args.seconds), indent=2))

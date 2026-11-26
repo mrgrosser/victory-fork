@@ -1,0 +1,98 @@
+From 8eecdec633040faca35e73899a3aff052288f3a9 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 09:48:34 -0600
+Subject: [PATCH 2/3] Roll back unpublished placed textures if lifetime
+ attachment fails
+
+---
+ crates/victory-gpu/src/pool.rs | 56 +++++++++++++++++++++++++++++-----
+ 1 file changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/crates/victory-gpu/src/pool.rs b/crates/victory-gpu/src/pool.rs
+index f00083c..1f00004 100644
+--- a/crates/victory-gpu/src/pool.rs
++++ b/crates/victory-gpu/src/pool.rs
+@@ -481,19 +481,26 @@ fn made_now(texture: &ID3D12Resource) {
+ }
+ 
+ /// Makes `texture` give `piece` back when the last reference to it goes.
+-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
++const LIFETIME_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
++
++fn give_back_with(
++    texture: ID3D12Resource, piece: Piece,
++    attach: impl FnOnce(&ID3D12Resource, &IUnknown) -> windows::core::Result<()>,
++) -> Option<ID3D12Resource> {
+     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+     // SAFETY: a COM object of ours with one reference, which this takes and
+     // drops at the end; the texture takes its own.
+     unsafe {
+         let object = IUnknown::from_raw(made.cast());
+-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+-            // Never given back: the piece stays taken, nothing is reused
+-            // under a texture that may be alive.
+-            std::mem::forget(object);
++        if let Err(error) = attach(&texture, &object) {
++            tracing::warn!(%error, "could not attach pooled texture lifetime");
++            // This resource has never been published. Destroy it before the
++            // local callback reference retires its range through normal Drop.
++            drop(texture);
++            return None;
+         }
+     }
++    Some(texture)
+ }
+ 
+ /// A texture of `desc` (no target, depth or unordered access) in a block;
+@@ -551,7 +558,10 @@ pub(crate) unsafe fn texture(
+     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
+     match (result, made) {
+         (Ok(()), Some(made)) => {
+-            give_back_with(&made, piece);
++            let made = give_back_with(made, piece, |resource, callback| {
++                // SAFETY: the resource retains the supplied COM reference on success.
++                unsafe { resource.SetPrivateDataInterface(&LIFETIME_KEY, callback) }
++            })?;
+             made_now(&made);
+             #[cfg(feature = "diagnostics")]
+             {
+@@ -723,6 +733,38 @@ mod tests {
+         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+     }
+ 
++    /// Exercise the rollback with actual D3D resources and an injected driver failure.
++    #[test]
++    #[ignore = "requires a D3D12 device and an isolated process"]
++    fn failed_lifetime_attachment_retires_every_piece() {
++        let host = crate::host::host().expect("D3D12 device required");
++        let (buffer, _) = host.upload_buffer(4096).expect("test resource");
++        let heap_desc = D3D12_HEAP_DESC {
++            SizeInBytes: BLOCK,
++            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
++            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
++            ..Default::default()
++        };
++        let mut heap = None;
++        // SAFETY: a valid default heap description and local output.
++        unsafe { host.device.CreateHeap(&heap_desc, &mut heap) }.unwrap();
++        let heap: ID3D12Heap = heap.unwrap();
++        let before = lock(&TEXTURES).resting.len();
++        let free = texture_room();
++        for _ in 0..128 {
++            let (piece, _, _) = lock(&TEXTURES).take(65536, 65536, 0, || Some(heap.clone())).unwrap();
++            assert!(give_back_with(buffer.clone(), piece, |_, _| Err(
++                windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY)
++            )).is_none());
++        }
++        let mut pool = lock(&TEXTURES);
++        assert_eq!(pool.resting.len(), before + 128);
++        assert_eq!(pool.free_bytes, free + BLOCK - 128 * 65536);
++        pool.reclaim(u64::MAX, 0, true);
++        assert_eq!(pool.free_bytes, free);
++        assert_eq!(pool.resting.len(), 0);
++    }
++
+     /// A pooled texture's piece comes back when its last reference goes, not
+     /// before; its staging piece begins as zeros.
+     #[test]
