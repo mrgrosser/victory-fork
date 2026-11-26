@@ -13,7 +13,9 @@ param(
     [ValidateRange(1,86400)][int]$Seconds = 425,
     [ValidateRange(1,16384)][int]$BufferMiB = 512,
     [string]$Keys = '',
-    [switch]$TraceBuilder
+    [switch]$TraceBuilder,
+    [switch]$PackTextureHeaps,
+    [ValidatePattern('^[A-Za-z]:$')][string]$RequireDrive
 )
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
@@ -22,6 +24,13 @@ $profile = (Get-Item -LiteralPath $ProfileSeed).FullName
 $cache = (Get-Item -LiteralPath $CacheSeed).FullName
 $defaults = (Get-Item -LiteralPath $LauncherDefaults).FullName
 $dest = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputRoot)
+if ($RequireDrive) {
+    foreach ($path in $exe,$gameFile,$profile,$cache,$defaults,$dest) {
+        if ([IO.Path]::GetPathRoot($path).TrimEnd('\') -ne $RequireDrive) {
+            throw "Expected every benchmark path on $RequireDrive but received $path"
+        }
+    }
+}
 foreach ($seed in $profile,$cache) {
     $prefix = $seed.TrimEnd('\') + '\'
     if (($dest.TrimEnd('\') + '\').StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
@@ -60,11 +69,12 @@ $settings['VICTORY_CACHE_DIR'] = "$run/cache"
 $settings['VICTORY_CARD_BUFFERS_MB'] = [string]$BufferMiB
 $settings['VICTORY_BENCH_PRESENTS'] = '1'
 $settings['VICTORY_FRAME_LOG'] = '1'
-$settings['VICTORY_LOG'] = 'warn,checkpoint_bench=info'
+$settings['VICTORY_LOG'] = 'warn,checkpoint_bench=info,victory_gpu::ambient=info'
 if ($Keys) { $settings['VICTORY_KEYS'] = $Keys }
+if ($PackTextureHeaps) { $settings['VICTORY_PACK_TEXTURE_HEAPS'] = '1' }
 if ($TraceBuilder) {
     $settings['VICTORY_BVH_BUILDER'] = '1'
-    $settings['VICTORY_LOG'] += ',victory_gpu::pipeline=info,victory_gpu::ambient=info'
+    $settings['VICTORY_LOG'] += ',victory_gpu::pipeline=info'
 }
 $profileFiles = Get-ChildItem -LiteralPath "$run/data" -File -Recurse | Where-Object {
     $_.FullName -match '[\\/]saves[\\/]' -or $_.Name -eq 'settings.xml'
@@ -72,11 +82,15 @@ $profileFiles = Get-ChildItem -LiteralPath "$run/data" -File -Recurse | Where-Ob
     [ordered]@{path=[IO.Path]::GetRelativePath("$run/data",$_.FullName); sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}
 }
 $pso = "$run/cache/pipelines/host-pipelines.bin"
+$shaderCount = 0
+if (Test-Path -LiteralPath "$run/cache/shaders") {
+    $shaderCount = (Get-ChildItem -LiteralPath "$run/cache/shaders" -File -Recurse | Measure-Object).Count
+}
 $manifest = [ordered]@{
     scenario=$Scenario; console=$Console; renderer=(Get-FileHash -LiteralPath $exe).Hash
     guest=(Get-FileHash -LiteralPath $gameFile).Hash; profile=@($profileFiles)
     cacheSeed=$cache; cacheMode=$CacheMode; initialPsoSha256=if (Test-Path -LiteralPath $pso) {(Get-FileHash -LiteralPath $pso).Hash}
-    seconds=$Seconds; settings=$settings; launcherDefaults=(Get-FileHash -LiteralPath $defaults).Hash
+    initialShaderEntries=$shaderCount; seconds=$Seconds; settings=$settings; launcherDefaults=(Get-FileHash -LiteralPath $defaults).Hash
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$run/manifest.json"
 $info = [Diagnostics.ProcessStartInfo]::new($exe)
@@ -86,6 +100,9 @@ foreach ($name in @($info.Environment.Keys)) {
     if ($name -like 'VICTORY_*') { [void]$info.Environment.Remove($name) }
 }
 foreach ($name in $settings.Keys) { $info.Environment[$name] = $settings[$name] }
+$tempDirectory = [IO.Directory]::CreateDirectory("$run/tmp").FullName
+$info.Environment['TEMP'] = $tempDirectory
+$info.Environment['TMP'] = $tempDirectory
 $info.Environment['RUST_LOG'] = $settings['VICTORY_LOG']
 foreach ($arg in 'run',$gameFile,'--console',$Console,'--execute') { $info.ArgumentList.Add($arg) }
 $info.RedirectStandardOutput = $true
