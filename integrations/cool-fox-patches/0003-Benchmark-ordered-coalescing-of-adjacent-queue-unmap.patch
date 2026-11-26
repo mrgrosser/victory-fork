@@ -1,0 +1,98 @@
+From cb3f13d407e80b7b43678179b7d7520f7576f9ed Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 08:34:49 -0600
+Subject: [PATCH 3/3] Benchmark ordered coalescing of adjacent queue unmaps
+
+---
+ crates/victory-hle/src/modules/xmem.rs | 59 ++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index e074582..337655d 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -1200,11 +1200,43 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+     true
+ }
+ 
++/// Adjacent clears in the same queue call have no intervening source read.
++fn serial_alias_ranges(mut ranges: &[(u64, u64, u64)], mut apply: impl FnMut(u64, u64, u64) -> bool) -> bool {
++    while let Some((&(to, from, mut len), rest)) = ranges.split_first() {
++        ranges = rest;
++        if from == 0 && len != 0 && to % PAGE as u64 == 0 && len % PAGE as u64 == 0 {
++            while let Some((&(next, 0, size), rest)) = ranges.split_first() {
++                if size == 0 || size % PAGE as u64 != 0 || to.checked_add(len) != Some(next) || next.checked_add(size).is_none() {
++                    break;
++                }
++                len += size;
++                ranges = rest;
++            }
++        }
++        if !apply(to, from, len) {
++            return false;
++        }
++    }
++    true
++}
++
+ /// [`map_alias`] of many ranges, in order.
+ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+     let _costed = Costed::begin(None);
+     lift_thread();
+     if side_by_side() <= 1 {
++        static JOIN: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_JOIN_UNMAPS").is_some_and(|v| v == "1"));
++        if *JOIN {
++            let mut calls = 0usize;
++            let ok = serial_alias_ranges(ranges, |to, from, len| {
++                calls += 1;
++                map_alias(to, from, len)
++            });
++            if ok && calls < ranges.len() && std::env::var_os("VICTORY_PAGE_CENSUS").is_some() {
++                tracing::info!(target: "checkpoint_bench", saved = ranges.len() - calls, "joined unmap ranges");
++            }
++            return ok;
++        }
+         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+     }
+     // By the page: the address, and the one whose page it is to show.
+@@ -1916,6 +1948,18 @@ mod tests {
+         info
+     }
+ 
++    #[test]
++    fn adjacent_clears_stop_at_reads_gaps_and_repeated_destinations() {
++        let p = PAGE as u64;
++        let input = [(p,0,p),(2*p,0,p),(3*p,p,p),(4*p,0,p),(4*p,0,p),(6*p,0,p)];
++        let mut seen = Vec::new();
++        assert!(serial_alias_ranges(&input, |a,b,c| { seen.push((a,b,c)); true }));
++        assert_eq!(seen, [(p,0,2*p),(3*p,p,p),(4*p,0,p),(4*p,0,p),(6*p,0,p)]);
++        let mut calls = 0;
++        assert!(!serial_alias_ranges(&input, |_,_,_| { calls += 1; calls < 2 }));
++        assert_eq!(calls, 2);
++    }
++
+     #[test]
+     fn alloc_honours_alignment_and_frees() {
+         for (field, align) in [(0, 16), (4, 16), (0xc, 4096), (0x10, 64 * 1024)] {
+@@ -2096,6 +2140,21 @@ mod tests {
+         assert!(map_alias(b as u64, 0, PAGE as u64));
+         assert_eq!(query(b).host.State, MEM_RESERVE);
+         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
++        // Clear the front of a three-page view and keep a second alias of its tail.
++        let whole = reserve();
++        assert!(!whole.is_null());
++        assert_eq!(XMemMapPhysicalPages(whole, 3, pages.as_ptr()), whole);
++        assert!(map_alias(b as u64, at(whole, 2) as u64, PAGE as u64));
++        let clears = [(whole as u64, 0, PAGE as u64), (at(whole, 1) as u64, 0, PAGE as u64)];
++        assert!(serial_alias_ranges(&clears, map_alias));
++        assert_eq!(query(whole).host.State, MEM_RESERVE);
++        assert_eq!(query(at(whole, 1)).host.State, MEM_RESERVE);
++        assert_eq!(query(at(whole, 2)).host.State, MEM_COMMIT);
++        // SAFETY: these two committed addresses still alias the tail page.
++        unsafe {
++            at(whole, 2).cast::<u8>().write(11);
++            assert_eq!(b.cast::<u8>().read(), 11);
++        }
+         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+         assert_eq!(XMemIsToolsMemAvailable(), 0);
+     }

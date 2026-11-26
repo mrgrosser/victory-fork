@@ -1,0 +1,44 @@
+From dd82a87c840eb83f2a559d61ef940b1fe20be074 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 08:34:48 -0600
+Subject: [PATCH 2/3] Count console page mapping kinds on benchmark runs
+
+---
+ crates/victory-gpu/src/queue.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 2a908ec..2848bec 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -1177,6 +1177,9 @@ extern "system" fn copy_page_mappings(
+         }
+         None => map(to, from, len),
+     };
++    static CENSUS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PAGE_CENSUS").is_some());
++    let mut range_counts = [0u64; 4];
++    let mut page_counts = [0u64; 4];
+     for b in batches.into_iter().flatten() {
+         if b.ranges.is_null() {
+             continue;
+@@ -1188,6 +1191,10 @@ extern "system" fn copy_page_mappings(
+             let len = u64::from(r.count) * PAGE;
+             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+             let source = pool + u64::from(r.start) * PAGE;
++            if *CENSUS && r.kind < 4 {
++                range_counts[r.kind as usize] += 1;
++                page_counts[r.kind as usize] += u64::from(r.count);
++            }
+             ok &= match r.kind {
+                 0 if inside(r.count) => map(at, source, len),
+                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+@@ -1198,6 +1205,9 @@ extern "system" fn copy_page_mappings(
+             at += len;
+         }
+     }
++    if *CENSUS {
++        tracing::info!(target: "checkpoint_bench", ?range_counts, ?page_counts, "page batch");
++    }
+     if let Some(many) = many {
+         ok &= many(&gathered);
+     }

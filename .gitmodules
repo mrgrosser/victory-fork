@@ -1,0 +1,3 @@
+[submodule "cool-fox"]
+	path = integrations/cool-fox
+	url = https://github.com/DoubleGhosty/cool_fox.git
