@@ -768,29 +768,52 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    if len == 0 {
+        return true;
+    }
+    // Resolve every source before changing the destination. Besides making
+    // overlapping alias copies work, this lets consecutive slices of one
+    // section become one host view instead of one view per 64 KiB page.
+    let source: Vec<Slice> = if from == 0 {
+        Vec::new()
+    } else {
+        let mut source = Vec::with_capacity(len.div_ceil(PAGE));
+        for k in (0..len).step_by(PAGE) {
+            let at = from + k;
+            let Some(slice) = physical
+                .views
+                .range(..=at)
+                .next_back()
+                .filter(|(base, (size, _))| at < *base + size)
+                .map(|(base, (_, s))| Slice {
+                    index: s.index + (at - base) / PAGE,
+                    section: s.section.clone(),
+                })
+            else {
+                return false;
+            };
+            source.push(slice);
+        }
+        source
+    };
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
+    let mut page = 0;
+    while page < source.len() {
+        let first = source[page].clone();
+        let run = 1 + source[page + 1..]
+            .iter()
+            .zip(1..)
+            .take_while(|&(slice, k)| {
+                Arc::ptr_eq(&slice.section, &first.section)
+                    && slice.index == first.index + k
             })
-        else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
+            .count();
+        if !map(&mut physical, to + page * PAGE, run * PAGE, first) {
             return false;
         }
+        page += run;
     }
     true
 }
@@ -1416,6 +1439,68 @@ mod tests {
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+
+    #[test]
+    fn alias_mapping_groups_consecutive_pages_and_preserves_overlap() {
+        let pages = allocate(4);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        let b = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        for k in 0..4 {
+            // SAFETY: all four source pages are mapped read-write.
+            unsafe {
+                a.wrapping_byte_add(k * PAGE)
+                    .cast::<u8>()
+                    .write((k + 1) as u8)
+            };
+        }
+
+        assert!(map_alias(b as u64, a as u64, (4 * PAGE) as u64));
+        assert_eq!(
+            physical().views.get(&(b as usize)).map(|v| v.0),
+            Some(4 * PAGE)
+        );
+        for k in 0..4 {
+            // SAFETY: the alias maps the same four pages.
+            assert_eq!(
+                unsafe { b.wrapping_byte_add(k * PAGE).cast::<u8>().read() },
+                (k + 1) as u8
+            );
+        }
+
+        // Resolve the source before replacing the overlapping destination.
+        assert!(map_alias(
+            a.wrapping_byte_add(PAGE) as u64,
+            a as u64,
+            (2 * PAGE) as u64,
+        ));
+        assert_eq!(
+            unsafe { a.wrapping_byte_add(PAGE).cast::<u8>().read() },
+            1
+        );
+        assert_eq!(
+            unsafe { a.wrapping_byte_add(2 * PAGE).cast::<u8>().read() },
+            2
+        );
+
+        assert!(map_alias(b as u64, 0, (4 * PAGE) as u64));
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
